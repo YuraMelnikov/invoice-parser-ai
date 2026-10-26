@@ -1,0 +1,144 @@
+{
+  "name": "Invoice-006_Matcher",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 10
+            }
+          ]
+        }
+      },
+      "id": "6a7c0006-0001-4000-8000-000000000001",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -1900,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Позиции, которые матчер ещё не видел (эмбеддинг готов), батч 32.\nSELECT ii.id AS item_id, i.file_name, ii.line_no, ii.item_name\nFROM docs.invoice_items ii\nJOIN docs.invoices i ON i.id = ii.invoice_id\nJOIN docs.item_embeddings ie\n  ON ie.file_name = i.file_name AND ie.line_no = ii.line_no\nWHERE ii.link_processed = false\nORDER BY ii.id\nLIMIT 32;",
+        "options": {}
+      },
+      "id": "6a7c0006-0002-4000-8000-000000000002",
+      "name": "Get queue (not linked)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.3,
+      "position": [
+        -1680,
+        300
+      ],
+      "executeOnce": true,
+      "credentials": {
+        "postgres": {
+          "id": "uSXpwajUhahtQd3N",
+          "name": "Postgres (invoices)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Гибридный матчер (задача 002, ADR-0004).\n// bge-m3 НЕ различает артикулы, отличающиеся одним знаком (калибровка\n// 2026-10-07: «…18.42» к «…18.41» даёт score 0.92), поэтому:\n//   1) артикул есть с обеих сторон и совпал  -> линкуем, method='article';\n//   2) артикул есть с обеих сторон и РАЗЛИЧАЕТСЯ -> ВЕТО (другая модель),\n//      кандидат вычёркивается независимо от score;\n//   3) артикула нет хотя бы с одной стороны -> решает вектор (score >= T1),\n//      method='vector'.\nconst T1 = 0.85; // утверждён владельцем по калибровке 2026-10-07 (ADR-0004)\nconst crypto = require('crypto');\n\nconst CYR2LAT = { 'А':'A','В':'B','С':'C','Е':'E','Н':'H','К':'K','М':'M','О':'O','Р':'P','Т':'T','Х':'X' };\nfunction extractArticle(s) {\n  if (!s) return null;\n  const t = String(s).toUpperCase();\n  // токен «буквы + цифры с разделителями» (ДПП22-20.137.18.41, ПВ3-10, PCAM_0744_000_114-102);\n  // цифровые типоразмеры (14х1, 2050x1420x3) НЕ извлекаем — их решает вектор\n  const m = t.match(/[A-ZА-Я][\\dA-ZА-Я()]*(?:\\s*[-._\\/]\\s*[\\dA-ZА-Я()]+)+/g);\n  if (!m || !m.length) return null;\n  for (const cand of m.sort((a, b) => b.length - a.length)) {\n    const norm = cand.replace(/[АВСЕНКМОРТХ]/g, ch => CYR2LAT[ch]).replace(/[^A-Z0-9А-Я]/g, '');\n    if (/^(?=.*\\d)[A-Z0-9А-Я]{4,}$/.test(norm)) return norm;\n  }\n  return null;\n}\nfunction uuid5(text) {\n  const h = crypto.createHash('sha1').update(text).digest();\n  h[6] = (h[6] & 0x0f) | 0x50;\n  h[8] = (h[8] & 0x3f) | 0x80;\n  const hex = h.toString('hex');\n  return hex.slice(0, 8) + '-' + hex.slice(8, 12) + '-' + hex.slice(12, 16) + '-' + hex.slice(16, 20) + '-' + hex.slice(20, 32);\n}\nconst rows = $input.all().map(x => x.json);\nif (!rows.length) return [];\n\nconst ids = rows.map(r => uuid5('item:' + r.file_name + ':' + r.line_no));\nconst got = await this.helpers.httpRequest({\n  method: 'POST',\n  url: 'http://qdrant:6333/collections/invoice_items/points',\n  body: { ids: ids, with_vector: true, with_payload: false },\n  json: true\n});\nconst vecById = {};\nfor (const p of (got.result || [])) vecById[String(p.id)] = p.vector;\n\nconst searchable = rows.map((r, i) => ({ r: r, id: ids[i], v: vecById[ids[i]] }))\n  .filter(x => Array.isArray(x.v));\n// Позиции без вектора пропускаем (link_processed НЕ ставим — повторит тиком).\nif (!searchable.length) return [];\n\n// top-5: артикульный кандидат может быть не первым по вектору\nconst resp = await this.helpers.httpRequest({\n  method: 'POST',\n  url: 'http://qdrant:6333/collections/sku_catalog/points/search/batch',\n  body: { searches: searchable.map(x => ({ vector: x.v, limit: 5, with_payload: true })) },\n  json: true\n});\nconst results = (resp.result || []);\nif (results.length !== searchable.length) {\n  throw new Error('SEARCH_MISMATCH: ожидалось ' + searchable.length + ' ответов, пришло ' + results.length);\n}\n\nconst updates = searchable.map((x, i) => {\n  const rowArt = extractArticle(x.r.item_name);\n  const cands = (results[i] || []).map(h => ({\n    code: h.payload ? String(h.payload.code) : null,\n    name: h.payload ? String(h.payload.item_name) : null,\n    score: Number(h.score),\n    art: h.payload ? extractArticle(h.payload.item_name) : null\n  }));\n  let sku = null, method = null, score = null;\n  if (rowArt) {\n    // шаг 1: точное совпадение артикула\n    const exact = cands.filter(c => c.art && c.art === rowArt)\n      .sort((a, b) => b.score - a.score)[0];\n    if (exact) {\n      sku = exact.code; method = 'article'; score = exact.score;\n    } else {\n      // шаг 2: вето на чужой артикул; вектор — только по кандидатам без артикула\n      const free = cands.filter(c => !c.art);\n      const top = free.sort((a, b) => b.score - a.score)[0];\n      if (top && top.score >= T1) { sku = top.code; method = 'vector'; score = top.score; }\n      else if (top) { score = top.score; }\n    }\n  } else {\n    // шаг 3: артикула в позиции нет — обычный векторный top-1\n    const top = cands.sort((a, b) => b.score - a.score)[0];\n    if (top) {\n      score = top.score;\n      if (top.score >= T1) { sku = top.code; method = 'vector'; }\n    }\n  }\n  return { item_id: Number(x.r.item_id), sku_code: sku, link_score: score, link_method: method };\n});\nreturn [{ json: { updates: JSON.stringify(updates).replace(/'/g, \"''\"), matched: updates.filter(u => u.sku_code).length, total: updates.length } }];"
+      },
+      "id": "6a7c0006-0003-4000-8000-000000000003",
+      "name": "Match (Qdrant)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1460,
+        300
+      ],
+      "settings": {
+        "onError": "continueErrorOutput"
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Результат линковки — в строку позиции (задача 002). Идемпотентно:\n-- матчер берёт только link_processed=false, флаг ставится здесь же.\nUPDATE docs.invoice_items ii\nSET sku_code = r.sku_code,\n    link_score = r.link_score,\n    link_method = r.link_method,\n    link_processed = true\nFROM jsonb_to_recordset('{{ $('Match (Qdrant)').first().json.updates }}'::jsonb)\n  AS r(item_id bigint, sku_code text, link_score numeric, link_method text)\nWHERE ii.id = r.item_id;",
+        "options": {}
+      },
+      "id": "6a7c0006-0004-4000-8000-000000000004",
+      "name": "Write links",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.3,
+      "position": [
+        -1240,
+        300
+      ],
+      "executeOnce": true,
+      "credentials": {
+        "postgres": {
+          "id": "uSXpwajUhahtQd3N",
+          "name": "Postgres (invoices)"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "id": "6a7c0006-0005-4000-8000-000000000005",
+      "name": "Error sink (see executions)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        -1460,
+        540
+      ]
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Get queue (not linked)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get queue (not linked)": {
+      "main": [
+        [
+          {
+            "node": "Match (Qdrant)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Match (Qdrant)": {
+      "main": [
+        [
+          {
+            "node": "Write links",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error sink (see executions)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "tags": []
+}

@@ -1,0 +1,484 @@
+{
+  "name": "Invoice-002_Worker",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "nakladnye-worker",
+        "options": {}
+      },
+      "id": "d943dc43-77e8-42ca-a9c2-b42af514c399",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        5760,
+        5040
+      ],
+      "webhookId": "fb2ebb22-b8c2-4106-a49c-e46a48060810"
+    },
+    {
+      "parameters": {
+        "url": "http://pdf-render:8000/render",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "file",
+              "value": "={{ $json.body.file_name }}"
+            },
+            {
+              "name": "dpi",
+              "value": "400"
+            },
+            {
+              "name": "max_pages",
+              "value": "2"
+            },
+            {
+              "name": "autorotate",
+              "value": "1"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 300000
+        }
+      },
+      "id": "cbc6fb0f-7965-4d95-bc77-423885152b2e",
+      "name": "Render PDF",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        6000,
+        5040
+      ],
+      "settings": {
+        "onError": "continueErrorOutput"
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Собираем запрос к qwen3-vl:8b. Страницы из pdf-render уходят\n// одним сообщением (images[]). Формат ответа жёстко задан JSON-схемой:\n// только позиции (items), шапку не извлекаем (решение владельца 2026-10-05).\n// Промт — единый источник: /data/shared/prompts/extract_items_system.txt\n// (тот же файл читает tests/run_eval.py — eval мерит продовый промт).\nconst fs = require('fs');\nconst render = $input.first().json;\nconst body = $('Webhook').first().json.body;\nif (!render.pages || !render.pages.length) {\n  throw new Error('RENDER_FAIL: ' + JSON.stringify(render).slice(0, 400));\n}\nconst systemPrompt = fs.readFileSync('/data/shared/prompts/extract_items_system.txt', 'utf8').trim();\nconst payload = {\n  model: 'qwen3-vl:8b-instruct-q8_0',\n  think: false,\n  stream: false,\n  format: {\n    type: 'object',\n    properties: {\n      items: {\n        type: 'array',\n        items: {\n          type: 'object',\n          properties: {\n            line_no: { type: 'integer' },\n            item_name: { type: 'string' },\n            unit: { type: ['string', 'null'] },\n            quantity: { type: ['number', 'null'] },\n            price: { type: ['number', 'null'] }\n          },\n          required: ['line_no', 'item_name'],\n          additionalProperties: false\n        }\n      }\n    },\n    required: ['items'],\n    additionalProperties: false\n  },\n  options: { temperature: 0, num_ctx: 16384 },\n  messages: [\n    { role: 'system', content: systemPrompt },\n    { role: 'user', content: 'Извлеки позиции накладной.', images: render.pages }\n  ]\n};\nreturn { json: { payload: payload, doc_id: body.doc_id, file_name: body.file_name } };"
+      },
+      "id": "57ca44a8-c942-4bed-a419-bd9a7812fad1",
+      "name": "Build VLM request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6240,
+        5040
+      ],
+      "settings": {
+        "onError": "continueErrorOutput"
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://ollama:11434/api/chat",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.payload }}",
+        "options": {
+          "timeout": 1800000
+        }
+      },
+      "id": "a7e7c52f-b2a8-4031-9b88-d8c4c2f1af4e",
+      "name": "Ollama extract",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        6480,
+        5040
+      ],
+      "settings": {
+        "onError": "continueErrorOutput"
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Разбор и валидация ответа VLM. Числа приводим к number\n// (десятичная запятая -> точка), строки с пустым наименованием выбрасываем.\n// Сырой ответ сохраняем целиком — уйдёт в docs.invoices.raw_json.\nconst resp = $input.first().json;\nconst ctx = $('Build VLM request').first().json;\nif (resp.error) {\n  throw new Error('OLLAMA_FAIL: ' + JSON.stringify(resp.error).slice(0, 400));\n}\nlet content = (resp.message && resp.message.content) || '';\ncontent = content.replace(/```json|```/g, '').trim();\nlet data;\ntry {\n  data = JSON.parse(content);\n} catch (e) {\n  throw new Error('PARSE_FAIL: ' + e.message + ' | ' + content.slice(0, 300));\n}\nif (!data || !Array.isArray(data.items)) {\n  throw new Error('PARSE_FAIL: в ответе нет массива items');\n}\nconst num = v => {\n  if (v === null || v === undefined || v === '') return null;\n  const n = Number(String(v).replace(',', '.'));\n  return Number.isFinite(n) ? n : null;\n};\nconst items = data.items.map((it, i) => ({\n  line_no: Number.isInteger(it.line_no) ? it.line_no : i + 1,\n  item_name: String(it.item_name ?? '').trim(),\n  unit: it.unit == null ? null : String(it.unit).trim(),\n  quantity: num(it.quantity),\n  price: num(it.price)\n})).filter(it => it.item_name);\nconst esc = s => String(s).replace(/'/g, \"''\");\nreturn { json: {\n  doc_id: ctx.doc_id,\n  file_name: ctx.file_name,\n  file_name_sql: esc(ctx.file_name),\n  raw_sql: esc(content),\n  items,\n  items_count: items.length\n} };"
+      },
+      "id": "99050bbd-a144-4122-bc93-441ae4125e42",
+      "name": "Parse & validate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6720,
+        5040
+      ],
+      "settings": {
+        "onError": "continueErrorOutput"
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Идемпотентно: повторная обработка того же файла перезаписывает raw_json.\nINSERT INTO docs.invoices (file_name, raw_json)\nVALUES ('{{ $json.file_name_sql }}', '{{ $json.raw_sql }}'::jsonb)\nON CONFLICT (file_name) DO UPDATE SET raw_json = EXCLUDED.raw_json\nRETURNING id;",
+        "options": {}
+      },
+      "id": "60d6d99d-485b-4879-9f46-d63ac814649f",
+      "name": "Upsert invoice",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.3,
+      "position": [
+        6960,
+        5040
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "Pacf2HwhlWAmpbsp",
+          "name": "Postgres account"
+        }
+      },
+      "settings": {
+        "onError": "continueErrorOutput"
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "cond-items-nonempty",
+              "leftValue": "={{ $('Parse & validate').first().json.items_count }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "2e74e0d5-9a4a-4553-8744-1052a41abbc0",
+      "name": "Has items?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        7200,
+        5040
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Мультистроковый INSERT позиций. Строки экранируем (кавычки),\n// NULL — без кавычек. invoice_id — из Upsert invoice.\nconst inv = $('Upsert invoice').first().json;\nconst parsed = $('Parse & validate').first().json;\nconst esc = s => String(s).replace(/'/g, \"''\");\nconst vals = parsed.items.map(it =>\n  `(${inv.id}, ${it.line_no}, '${esc(it.item_name)}', ` +\n  `${it.unit === null ? 'NULL' : `'${esc(it.unit)}'`}, ` +\n  `${it.quantity === null ? 'NULL' : it.quantity}, ` +\n  `${it.price === null ? 'NULL' : it.price})`\n).join(',\\n');\nreturn { json: { invoice_id: inv.id, values_sql: vals } };"
+      },
+      "id": "3f6aa580-358d-4fd1-81dd-16e2fb7a8dcf",
+      "name": "Build items SQL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        7440,
+        4912
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Идемпотентность при повторной обработке: старые позиции стираем.\nDELETE FROM docs.invoice_items\nWHERE invoice_id = {{ $json.invoice_id }};",
+        "options": {}
+      },
+      "id": "a6db54c8-44d2-43d4-87c6-980fee24029a",
+      "name": "Delete old items",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.3,
+      "position": [
+        7680,
+        4912
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "Pacf2HwhlWAmpbsp",
+          "name": "Postgres account"
+        }
+      },
+      "settings": {
+        "onError": "continueErrorOutput"
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO docs.invoice_items (invoice_id, line_no, item_name, unit, quantity, price)\nVALUES {{ $('Build items SQL').first().json.values_sql }};",
+        "options": {}
+      },
+      "id": "b2e4cad0-1ca5-4943-972b-b08dbace387b",
+      "name": "Insert items",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.3,
+      "position": [
+        7920,
+        4912
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "Pacf2HwhlWAmpbsp",
+          "name": "Postgres account"
+        }
+      },
+      "settings": {
+        "onError": "continueErrorOutput"
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE docs.documents\nSET status = 'done', status_changed_at = now(), processed_at = now(), error_message = NULL\nWHERE id = '{{ $('Parse & validate').first().json.doc_id }}'::bigint;",
+        "options": {}
+      },
+      "id": "4c465981-72ec-47f7-af53-172fc97d826e",
+      "name": "Set done",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.3,
+      "position": [
+        8160,
+        5040
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "Pacf2HwhlWAmpbsp",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Сбор ошибки из любой упавшей ветки -> status='error'.\nconst err = $input.first().json;\nconst msg = (err.error && (err.error.message || JSON.stringify(err.error)))\n  || err.message || JSON.stringify(err);\nconst body = $('Webhook').first().json.body;\nreturn { json: {\n  doc_id: body.doc_id,\n  error_sql: String(msg).replace(/'/g, \"''\").slice(0, 900)\n} };"
+      },
+      "id": "094f2246-f96d-413d-97ed-0e20ae80224e",
+      "name": "Build error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6960,
+        5360
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE docs.documents\nSET status = 'error', error_message = '{{ $json.error_sql }}',\n    status_changed_at = now(), processed_at = now()\nWHERE id = '{{ $json.doc_id }}'::bigint;",
+        "options": {}
+      },
+      "id": "5133196c-04fc-4db0-bb2e-dbbfbbfb6c99",
+      "name": "Set error",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.3,
+      "position": [
+        7200,
+        5360
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "Pacf2HwhlWAmpbsp",
+          "name": "Postgres account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Render PDF",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Render PDF": {
+      "main": [
+        [
+          {
+            "node": "Build VLM request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build VLM request": {
+      "main": [
+        [
+          {
+            "node": "Ollama extract",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama extract": {
+      "main": [
+        [
+          {
+            "node": "Parse & validate",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse & validate": {
+      "main": [
+        [
+          {
+            "node": "Upsert invoice",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert invoice": {
+      "main": [
+        [
+          {
+            "node": "Has items?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has items?": {
+      "main": [
+        [
+          {
+            "node": "Build items SQL",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Set done",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build items SQL": {
+      "main": [
+        [
+          {
+            "node": "Delete old items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delete old items": {
+      "main": [
+        [
+          {
+            "node": "Insert items",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert items": {
+      "main": [
+        [
+          {
+            "node": "Set done",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build error": {
+      "main": [
+        [
+          {
+            "node": "Set error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "timeSavedMode": "fixed",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false
+  },
+  "versionId": "e5681b94-46e8-4ee6-970a-1eeda0b8c60b",
+  "meta": {
+    "instanceId": "82aec983c31335c36b892f70f33fc80c789e16c8d44ebcef80783056190ec4c6"
+  },
+  "nodeGroups": [],
+  "id": "AuGhjByoizTdZhqD",
+  "tags": []
+}

@@ -1,0 +1,299 @@
+{
+  "name": "Invoice-005_SKU-sync",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 1
+            }
+          ]
+        }
+      },
+      "id": "e0514722-6bf9-4bca-8ae2-4fbd9dc862ac",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        2080,
+        544
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Создаёт коллекцию Qdrant sku_catalog, если её нет.\nlet status = 'exists';\ntry {\n  await this.helpers.httpRequest({ method: 'GET', url: 'http://qdrant:6333/collections/sku_catalog', json: true });\n} catch (e) {\n  try {\n    await this.helpers.httpRequest({\n      method: 'PUT',\n      url: 'http://qdrant:6333/collections/sku_catalog',\n      body: { vectors: { size: 1024, distance: 'Cosine' } },\n      json: true\n    });\n    status = 'created';\n  } catch (e2) {\n    throw new Error('Qdrant недоступен, коллекцию создать не удалось: ' + (e2.cause && e2.cause.message ? e2.cause.message : e2.message));\n  }\n}\nreturn { json: { collection: 'sku_catalog', status: status } };"
+      },
+      "id": "9d2b677e-ffc7-41df-9b6a-84b6274b6677",
+      "name": "Ensure collection",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2304,
+        544
+      ],
+      "settings": {
+        "onError": "continueErrorOutput"
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Полный справочник номенклатуры ERP (~365 строк).\n-- Кэша нет: каждый тик — полный рефреш коллекции\n-- (решение владельца 2026-10-07, задача 002).\nSELECT [code]\n      ,[name] AS item_name\n  FROM [exportImport].[dbo].[CurrentOrder]",
+        "options": {}
+      },
+      "id": "789326e0-cf1f-49d3-995b-2b4d4444fdf5",
+      "name": "Get SKU from ERP",
+      "type": "n8n-nodes-base.microsoftSql",
+      "typeVersion": 1.2,
+      "position": [
+        2528,
+        544
+      ],
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "credentials": {
+        "microsoftSql": {
+          "id": "__SET_IN_N8N__",
+          "name": "Microsoft SQL account"
+        }
+      },
+      "settings": {
+        "onError": "continueErrorOutput"
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Собираем тексты для bge-m3. Пустой справочник = сбой ERP:\n// прерываем тик, коллекцию НЕ трогаем (защита от wipe).\nconst rows = $input.all().map(x => x.json).filter(r => r && r.code && r.item_name);\nif (!rows.length) {\n  throw new Error('ERP_EMPTY: справочник пуст или недоступен — рефреш отменён');\n}\nreturn [{ json: {\n  items: rows.map(r => ({ code: String(r.code), item_name: String(r.item_name).slice(0, 1000) })),\n  texts: rows.map(r => String(r.item_name).slice(0, 1000))\n} }];"
+      },
+      "id": "6f2fd038-f965-442f-a263-edcd5837c19f",
+      "name": "Prepare texts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2744,
+        544
+      ],
+      "settings": {
+        "onError": "continueErrorOutput"
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://ollama:11434/api/embed",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'bge-m3', input: $json.texts }) }}",
+        "options": {
+          "timeout": 300000
+        }
+      },
+      "id": "087f3223-dd2a-44c0-bfa0-11f2ecbe7664",
+      "name": "Ollama embed (bge-m3)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2960,
+        544
+      ],
+      "settings": {
+        "onError": "continueErrorOutput"
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Точки Qdrant: id — детерминированный UUID v5 от кода SKU\n// (код текстовый, Qdrant требует число/UUID; crypto разрешён через\n// NODE_FUNCTION_ALLOW_BUILTIN).\nconst crypto = require('crypto');\nfunction uuid5(text) {\n  const h = crypto.createHash('sha1').update('sku:' + text).digest();\n  h[6] = (h[6] & 0x0f) | 0x50;\n  h[8] = (h[8] & 0x3f) | 0x80;\n  const hex = h.toString('hex');\n  return hex.slice(0, 8) + '-' + hex.slice(8, 12) + '-' + hex.slice(12, 16) + '-' + hex.slice(16, 20) + '-' + hex.slice(20, 32);\n}\nconst src = $('Prepare texts').first().json;\nconst embs = $json.embeddings || [];\nif (!Array.isArray(embs) || embs.length !== src.items.length) {\n  throw new Error('EMBED_MISMATCH: ожидалось ' + src.items.length + ' векторов, пришло ' + embs.length);\n}\nconst points = src.items.map((it, i) => ({\n  id: uuid5(it.code),\n  vector: embs[i],\n  payload: { code: it.code, item_name: it.item_name }\n}));\nreturn { json: {\n  points: points,\n  codes: src.items.map(it => it.code)\n} };"
+      },
+      "id": "095c414d-22ce-42ac-af38-0a4007520c67",
+      "name": "Build points",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3184,
+        544
+      ],
+      "settings": {
+        "onError": "continueErrorOutput"
+      }
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "http://qdrant:6333/collections/sku_catalog/points?wait=true",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ points: $json.points }) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "008e0a64-a95a-46a7-9a11-677345b0f139",
+      "name": "Qdrant upsert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3408,
+        544
+      ],
+      "settings": {
+        "onError": "continueErrorOutput"
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Удаляем из sku_catalog точки, чьих кодов больше нет в ERP\n// (полный рефреш: коллекция = зеркало справочника).\nconst current = new Set($('Build points').first().json.codes.map(String));\nlet stale = [];\nlet offset = null;\ndo {\n  const resp = await this.helpers.httpRequest({\n    method: 'POST',\n    url: 'http://qdrant:6333/collections/sku_catalog/points/scroll',\n    body: { limit: 256, with_payload: true, with_vector: false, offset: offset },\n    json: true\n  });\n  const pts = (resp.result && resp.result.points) || [];\n  for (const p of pts) {\n    const c = p.payload && p.payload.code;\n    if (!current.has(String(c))) stale.push(p.id);\n  }\n  offset = resp.result && resp.result.next_page_offset;\n} while (offset);\nif (stale.length) {\n  await this.helpers.httpRequest({\n    method: 'POST',\n    url: 'http://qdrant:6333/collections/sku_catalog/points/delete?wait=true',\n    body: { points: stale },\n    json: true\n  });\n}\nreturn { json: { sku_total: current.size, stale_deleted: stale.length } };"
+      },
+      "id": "e51a0001-0007-4000-8000-000000000007",
+      "name": "Delete stale",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3632,
+        544
+      ],
+      "settings": {
+        "onError": "continueErrorOutput"
+      }
+    },
+    {
+      "parameters": {},
+      "id": "86c271b7-cb89-4635-a072-4ac91aa5c919",
+      "name": "Error sink (see executions)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        2960,
+        784
+      ]
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Ensure collection",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ensure collection": {
+      "main": [
+        [
+          {
+            "node": "Get SKU from ERP",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error sink (see executions)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get SKU from ERP": {
+      "main": [
+        [
+          {
+            "node": "Prepare texts",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error sink (see executions)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare texts": {
+      "main": [
+        [
+          {
+            "node": "Ollama embed (bge-m3)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error sink (see executions)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama embed (bge-m3)": {
+      "main": [
+        [
+          {
+            "node": "Build points",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error sink (see executions)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build points": {
+      "main": [
+        [
+          {
+            "node": "Qdrant upsert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error sink (see executions)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Qdrant upsert": {
+      "main": [
+        [
+          {
+            "node": "Delete stale",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error sink (see executions)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "tags": []
+}

@@ -1,0 +1,206 @@
+{
+  "name": "Invoice-003_Archive",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes"
+            }
+          ]
+        }
+      },
+      "id": "18a79951-6b4e-47cd-878e-c1b95ee858dd",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        1472,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "command": "mkdir -p /data/docs/_archive /data/docs/_error"
+      },
+      "id": "d90ce7f4-2c71-4298-b95b-2ce64d08c85b",
+      "name": "Ensure archive dirs",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        1696,
+        160
+      ],
+      "executeOnce": true
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Файлы, завершившие обработку (done -> _archive, error -> _error),\n-- но ещё не выведенные из входной папки. Батч 20 за тик.\nSELECT id, file_name,\n       CASE WHEN status = 'done' THEN '_archive' ELSE '_error' END AS target_dir\nFROM docs.documents\nWHERE archived_at IS NULL\n  AND status IN ('done', 'error')\nORDER BY id\nLIMIT 20;",
+        "options": {}
+      },
+      "id": "3937798a-f899-43ed-a6bc-7e3154fe9b60",
+      "name": "Get finished (not moved)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.3,
+      "position": [
+        1920,
+        160
+      ],
+      "executeOnce": true,
+      "credentials": {
+        "postgres": {
+          "id": "Pacf2HwhlWAmpbsp",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "id": "eb791c34-927d-49ab-acd1-24673bb9e79d",
+      "name": "Loop Over Items",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        2144,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Перенос файла в target_dir (_archive / _error). Идемпотентно (ADR-0002):\n//  - src нет, dst есть -> файл уже перенесён прошлым тиком, просто идём к Mark;\n//  - dst занят -> суффикс даты-времени, архивный файл не затираем;\n//  - rename внутри одной шары мгновенный; EXDEV (разные монтирования) -> copy+unlink.\nconst fs = require('fs');\nconst src = '/data/docs/' + $json.file_name;\nconst dir = '/data/docs/' + $json.target_dir;\nlet dst = dir + '/' + $json.file_name;\n\nif (!fs.existsSync(src)) {\n  if (fs.existsSync(dst)) {\n    return { json: { id: $json.id, file_name: $json.file_name, note: 'already moved' } };\n  }\n  throw new Error('ARCHIVE_MOVE ' + $json.file_name + ': source missing on share');\n}\nif (fs.existsSync(dst)) {\n  const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);\n  dst = dir + '/' + ts + '_' + $json.file_name;\n}\ntry {\n  fs.renameSync(src, dst);\n} catch (e) {\n  if (e.code === 'EXDEV') {\n    fs.copyFileSync(src, dst);\n    fs.unlinkSync(src);\n  } else {\n    throw new Error('ARCHIVE_MOVE ' + $json.file_name + ': ' + e.message);\n  }\n}\nreturn { json: { id: $json.id, file_name: $json.file_name } };"
+      },
+      "id": "2f4bc06e-d32d-4cca-9252-ba8e8164c4af",
+      "name": "Move to target dir",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2352,
+        160
+      ],
+      "settings": {
+        "onError": "continueErrorOutput"
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE docs.documents\nSET archived_at = now()\nWHERE id = '{{ $json.id }}'::bigint;",
+        "options": {}
+      },
+      "id": "e6580298-63d9-4328-a41b-7c3be878d0ec",
+      "name": "Mark archived",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.3,
+      "position": [
+        2576,
+        160
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "Pacf2HwhlWAmpbsp",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "id": "cd80741a-10ec-4553-b2f4-5e89b8b6772f",
+      "name": "Error sink (see executions)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        2352,
+        400
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Ensure archive dirs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ensure archive dirs": {
+      "main": [
+        [
+          {
+            "node": "Get finished (not moved)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get finished (not moved)": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Move to target dir",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Move to target dir": {
+      "main": [
+        [
+          {
+            "node": "Mark archived",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark archived": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "timeSavedMode": "fixed",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false
+  },
+  "versionId": "24cc820c-2933-4344-9efd-5fd07a45c794",
+  "meta": {
+    "instanceId": "82aec983c31335c36b892f70f33fc80c789e16c8d44ebcef80783056190ec4c6"
+  },
+  "nodeGroups": [],
+  "id": "g6dhXEHvn9QBVNiz",
+  "tags": []
+}

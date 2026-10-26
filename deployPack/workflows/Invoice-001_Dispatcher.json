@@ -1,0 +1,287 @@
+{
+  "name": "Invoice-001_Dispatcher",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes"
+            }
+          ]
+        }
+      },
+      "id": "f6370c48-25a8-46ef-ac76-beeb9932432e",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        304,
+        496
+      ]
+    },
+    {
+      "parameters": {
+        "command": "sh -c 'cd /data/docs && for f in *.pdf; do [ -f \"$f\" ] || continue; s=$(stat -c \"%s|%Y\" \"$f\"); printf \"%s|%s\\n\" \"$f\" \"$s\"; done'"
+      },
+      "id": "087c1c54-3eca-46fc-bb5e-a593ea5a9e4d",
+      "name": "List PDF files",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        528,
+        496
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Разбираем stdout вида 'имя|размер|mtime' в отдельные items.\n// Разделитель '|' ищем с конца — имя файла может содержать '|'.\n// file_name_sql — то же имя с экранированными кавычками для подстановки в SQL.\nconst out = $input.first().json.stdout || '';\nconst items = out.split('\\n')\n  .map(l => l.trim())\n  .filter(Boolean)\n  .map(line => {\n    const parts = line.split('|');\n    const mtime = parseFloat(parts.pop());\n    const size = parseInt(parts.pop(), 10);\n    const name = parts.join('|');\n    return { json: {\n      file_name: name,\n      file_name_sql: name.replace(/'/g, \"''\"),\n      file_size: size,\n      file_mtime: mtime\n    } };\n  });\nreturn items;"
+      },
+      "id": "7cb26007-331b-4276-969b-e44874dc9690",
+      "name": "Parse file list",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        752,
+        496
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Регистрация новых файлов. Пока файл в статусе 'new', диспетчер\n-- каждый тик обновляет size/mtime — это основа проверки стабильности\n-- (ADR-0002): файл, который ещё копируется, в батч не попадёт.\nINSERT INTO docs.documents (file_name, file_path, file_size, file_mtime)\nVALUES ('{{ $json.file_name_sql }}', '{{ $json.file_name_sql }}', {{ $json.file_size }}, to_timestamp({{ $json.file_mtime }}))\nON CONFLICT (file_name) DO UPDATE SET\n  file_path = EXCLUDED.file_path,\n  file_size = EXCLUDED.file_size,\n  file_mtime = EXCLUDED.file_mtime\nWHERE docs.documents.status = 'new';",
+        "options": {}
+      },
+      "id": "9df9528d-7f09-4169-a826-63b0962b39c0",
+      "name": "Upsert to queue",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.3,
+      "position": [
+        976,
+        496
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "Pacf2HwhlWAmpbsp",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Восстановление после падения: зависшие processing (старше 30 мин) возвращаем в очередь\nUPDATE docs.documents\nSET status = 'new', status_changed_at = now()\nWHERE status = 'processing'\n  AND status_changed_at < now() - interval '30 minutes';",
+        "options": {}
+      },
+      "id": "a6708c8e-f19b-4802-a7f1-a42d3dcef6fe",
+      "name": "Reset stale processing",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.3,
+      "position": [
+        1184,
+        496
+      ],
+      "executeOnce": true,
+      "credentials": {
+        "postgres": {
+          "id": "Pacf2HwhlWAmpbsp",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Батч: 1 файл за запуск диспетчера (ADR-0003) — Ollama сериализует\n-- запросы, большой батч только ставит их в очередь до таймаута.\n-- Стабильность (ADR-0002): файл считается готовым, если его mtime\n-- старше 3 минут — файл, который ещё пишется на шару, сюда не попадёт.\nSELECT id, file_name\nFROM docs.documents\nWHERE status = 'new'\n  AND file_mtime < now() - interval '3 minutes'\nORDER BY id\nLIMIT 1;",
+        "options": {}
+      },
+      "id": "df28d7bd-5e80-4035-823e-4a61eb8aa33a",
+      "name": "Get batch (new docs)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.3,
+      "position": [
+        1408,
+        496
+      ],
+      "executeOnce": true,
+      "credentials": {
+        "postgres": {
+          "id": "Pacf2HwhlWAmpbsp",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "id": "c9d5d9b2-ad9f-47c2-b0f8-550d92126a32",
+      "name": "Loop Over Items",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        1632,
+        496
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Захват файла: переводим в processing до отправки воркеру.\n-- Если вернулось 0 строк (уже взяли) — ветка для этого файла остановится.\nUPDATE docs.documents\nSET status = 'processing', status_changed_at = now()\nWHERE id = '{{ $json.id }}'::bigint\n  AND status = 'new'\nRETURNING id, file_name;",
+        "options": {}
+      },
+      "id": "4ffea4a5-f95f-43fb-a831-b0c493b22b8a",
+      "name": "Claim doc",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.3,
+      "position": [
+        1856,
+        496
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "Pacf2HwhlWAmpbsp",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:5678/webhook/nakladnye-worker",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ doc_id: $json.id, file_name: $json.file_name }) }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "c744fe28-93f5-41b0-9021-2dd83d0185a1",
+      "name": "Dispatch to worker",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2064,
+        496
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "List PDF files",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "List PDF files": {
+      "main": [
+        [
+          {
+            "node": "Parse file list",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse file list": {
+      "main": [
+        [
+          {
+            "node": "Upsert to queue",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert to queue": {
+      "main": [
+        [
+          {
+            "node": "Reset stale processing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reset stale processing": {
+      "main": [
+        [
+          {
+            "node": "Get batch (new docs)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get batch (new docs)": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Items": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Claim doc",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim doc": {
+      "main": [
+        [
+          {
+            "node": "Dispatch to worker",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dispatch to worker": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "timeSavedMode": "fixed",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": false
+  },
+  "versionId": "a7ff24e0-9915-4ddb-ae67-d8aee67c3e82",
+  "meta": {
+    "instanceId": "82aec983c31335c36b892f70f33fc80c789e16c8d44ebcef80783056190ec4c6"
+  },
+  "nodeGroups": [],
+  "id": "Rm2lZBP8y0J0qAMr",
+  "tags": []
+}

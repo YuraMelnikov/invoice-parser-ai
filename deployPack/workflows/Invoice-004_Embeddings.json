@@ -1,0 +1,295 @@
+{
+  "name": "Invoice-004_Embeddings",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 10
+            }
+          ]
+        }
+      },
+      "id": "c3f0c003-0001-4000-8000-000000000001",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -1900,
+        -300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Создаёт коллекцию Qdrant, если её нет. Один выход — независимо от исхода.\nlet status = 'exists';\ntry {\n  await this.helpers.httpRequest({ method: 'GET', url: 'http://qdrant:6333/collections/invoice_items', json: true });\n} catch (e) {\n  try {\n    await this.helpers.httpRequest({\n      method: 'PUT',\n      url: 'http://qdrant:6333/collections/invoice_items',\n      body: { vectors: { size: 1024, distance: 'Cosine' } },\n      json: true\n    });\n    status = 'created';\n  } catch (e2) {\n    throw new Error('Qdrant недоступен, коллекцию создать не удалось: ' + (e2.cause && e2.cause.message ? e2.cause.message : e2.message));\n  }\n}\nreturn { json: { collection: 'invoice_items', status: status } };"
+      },
+      "id": "c3f0c003-0002-4000-8000-000000000002",
+      "name": "Ensure collection",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1680,
+        -300
+      ],
+      "settings": {
+        "onError": "continueErrorOutput"
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Позиции без эмбеддинга, батч 32 за тик.\n-- Ключ кэша — (file_name, line_no): устойчив к переобработке файла\n-- (worker делает delete+insert, item_id меняются). Задача 002, ADR-0004.\nSELECT ii.id AS item_id, i.file_name, ii.line_no, ii.item_name\nFROM docs.invoice_items ii\nJOIN docs.invoices i ON i.id = ii.invoice_id\nLEFT JOIN docs.item_embeddings ie\n  ON ie.file_name = i.file_name AND ie.line_no = ii.line_no\nWHERE ie.file_name IS NULL\n  AND ii.item_name IS NOT NULL\n  AND length(trim(ii.item_name)) > 1\nORDER BY ii.id\nLIMIT 32;",
+        "options": {}
+      },
+      "id": "c3f0c003-0003-4000-8000-000000000003",
+      "name": "Get batch (no embedding)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.3,
+      "position": [
+        -1460,
+        -300
+      ],
+      "executeOnce": true,
+      "credentials": {
+        "postgres": {
+          "id": "uSXpwajUhahtQd3N",
+          "name": "Postgres (invoices)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Собираем тексты для bge-m3.\n// Наименования кладём как есть (документный режим); query-префикс\n// использует матчер (Invoice-006) при поиске SKU.\nconst rows = $input.all().map(x => x.json);\nif (!rows.length) return [];\nreturn [{ json: {\n  items: rows.map(r => ({ item_id: r.item_id, file_name: r.file_name, line_no: r.line_no, item_name: r.item_name })),\n  texts: rows.map(r => String(r.item_name).slice(0, 2000))\n} }];"
+      },
+      "id": "c3f0c003-0004-4000-8000-000000000004",
+      "name": "Prepare texts",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1240,
+        -300
+      ],
+      "settings": {
+        "onError": "continueErrorOutput"
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://ollama:11434/api/embed",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'bge-m3', input: $json.texts }) }}",
+        "options": {
+          "timeout": 300000
+        }
+      },
+      "id": "c3f0c003-0005-4000-8000-000000000005",
+      "name": "Ollama embed (bge-m3)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -1020,
+        -300
+      ],
+      "settings": {
+        "onError": "continueErrorOutput"
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Собираем точки Qdrant и payload для записи в кэш.\n// id точки — детерминированный UUID v5 от (file_name, line_no):\n// переобработка файла перезаписывает те же точки, сирот не возникает\n// (задача 002, решение владельца 2026-10-07).\nconst crypto = require('crypto');\nfunction uuid5(text) {\n  const h = crypto.createHash('sha1').update(text).digest();\n  h[6] = (h[6] & 0x0f) | 0x50;\n  h[8] = (h[8] & 0x3f) | 0x80;\n  const hex = h.toString('hex');\n  return hex.slice(0, 8) + '-' + hex.slice(8, 12) + '-' + hex.slice(12, 16) + '-' + hex.slice(16, 20) + '-' + hex.slice(20, 32);\n}\nconst src = $('Prepare texts').first().json;\nconst embs = $json.embeddings || [];\nif (!Array.isArray(embs) || embs.length !== src.items.length) {\n  throw new Error('EMBED_MISMATCH: ожидалось ' + src.items.length + ' векторов, пришло ' + embs.length);\n}\nconst points = src.items.map((it, i) => ({\n  id: uuid5('item:' + it.file_name + ':' + it.line_no),\n  vector: embs[i],\n  payload: { file_name: it.file_name, line_no: it.line_no, item_id: it.item_id, item_name: it.item_name }\n}));\nconst cachePayload = { keys: src.items.map(it => ({ f: it.file_name, l: it.line_no })), model: 'bge-m3' };\nreturn { json: {\n  points: points,\n  cache_sql: JSON.stringify(cachePayload).replace(/'/g, \"''\")\n} };"
+      },
+      "id": "c3f0c003-0006-4000-8000-000000000006",
+      "name": "Build points",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -800,
+        -300
+      ],
+      "settings": {
+        "onError": "continueErrorOutput"
+      }
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "http://qdrant:6333/collections/invoice_items/points?wait=true",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ points: $json.points }) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "c3f0c003-0007-4000-8000-000000000007",
+      "name": "Qdrant upsert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -580,
+        -300
+      ],
+      "settings": {
+        "onError": "continueErrorOutput"
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Фиксируем, что векторы в Qdrant (идемпотентно).\nINSERT INTO docs.item_embeddings (file_name, line_no, model)\nSELECT r.f, r.l, 'bge-m3'\nFROM jsonb_to_recordset(('{{ $('Build points').first().json.cache_sql }}'::jsonb)->'keys') AS r(f text, l integer)\nON CONFLICT (file_name, line_no) DO NOTHING;",
+        "options": {}
+      },
+      "id": "c3f0c003-0008-4000-8000-000000000008",
+      "name": "Record embeddings",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.3,
+      "position": [
+        -360,
+        -300
+      ],
+      "executeOnce": true,
+      "credentials": {
+        "postgres": {
+          "id": "uSXpwajUhahtQd3N",
+          "name": "Postgres (invoices)"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "id": "c3f0c003-0009-4000-8000-000000000009",
+      "name": "Error sink (see executions)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        -1020,
+        -60
+      ]
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Ensure collection",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ensure collection": {
+      "main": [
+        [
+          {
+            "node": "Get batch (no embedding)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error sink (see executions)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get batch (no embedding)": {
+      "main": [
+        [
+          {
+            "node": "Prepare texts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare texts": {
+      "main": [
+        [
+          {
+            "node": "Ollama embed (bge-m3)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error sink (see executions)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama embed (bge-m3)": {
+      "main": [
+        [
+          {
+            "node": "Build points",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error sink (see executions)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build points": {
+      "main": [
+        [
+          {
+            "node": "Qdrant upsert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error sink (see executions)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Qdrant upsert": {
+      "main": [
+        [
+          {
+            "node": "Record embeddings",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error sink (see executions)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "pinData": {},
+  "tags": []
+}

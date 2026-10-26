@@ -1,0 +1,254 @@
+{
+  "name": "Invoice-007_ERP-export",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 5
+            }
+          ]
+        }
+      },
+      "id": "7a7c0007-0001-4000-8000-000000000001",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        2080,
+        544
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Таблицы приёма в ERP (задача 004, решение владельца 2026-10-07).\n-- Идемпотентно: создаём только если отсутствуют. Права на DDL у\n-- кредов «Microsoft SQL account» подтверждены владельцем.\nIF OBJECT_ID(N'exportImport.dbo.invoices', N'U') IS NULL\n    CREATE TABLE [exportImport].[dbo].[invoices] (\n        id        bigint        NOT NULL PRIMARY KEY,  -- id из docs.invoices\n        file_name nvarchar(500) NOT NULL\n    );\n\nIF OBJECT_ID(N'exportImport.dbo.invoice_items', N'U') IS NULL\n    CREATE TABLE [exportImport].[dbo].[invoice_items] (\n        id         bigint        NOT NULL PRIMARY KEY, -- id из docs.invoice_items\n        invoice_id bigint        NOT NULL\n                     REFERENCES [exportImport].[dbo].[invoices] (id) ON DELETE CASCADE,\n        line_no    int           NOT NULL,\n        item_name  nvarchar(max) NOT NULL,\n        unit       nvarchar(50)  NULL,\n        quantity   decimal(14,3) NULL,\n        price      decimal(14,2) NULL,\n        sku_code   nvarchar(200) NULL,\n        CONSTRAINT UQ_invoice_items UNIQUE (invoice_id, line_no)\n    );",
+        "options": {}
+      },
+      "id": "7a7c0007-0002-4000-8000-000000000002",
+      "name": "Ensure ERP tables",
+      "type": "n8n-nodes-base.microsoftSql",
+      "typeVersion": 1.2,
+      "position": [
+        2304,
+        544
+      ],
+      "executeOnce": true,
+      "alwaysOutputData": true,
+      "credentials": {
+        "microsoftSql": {
+          "id": "__SET_IN_N8N__",
+          "name": "Microsoft SQL account"
+        }
+      },
+      "settings": {
+        "onError": "continueErrorOutput"
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Кандидаты на выгрузку в ERP (задача 004, ADR-0005):\n-- exported_at IS NULL (новая накладная, либо переобработанная —\n-- триггер invoice_items_reset_export сбросил метку); есть хотя бы\n-- одна позиция; ВСЕ позиции отработаны матчером (link_processed=true,\n-- решение владельца 2026-10-07). Батч 10 накладных на тик (5 мин).\n-- Позиции забираем тем же запросом — дальше один T-SQL батч на накладную.\nSELECT i.id AS invoice_id, i.file_name,\n       (SELECT jsonb_agg(jsonb_build_object(\n                   'id', ii.id,\n                   'invoice_id', ii.invoice_id,\n                   'line_no', ii.line_no,\n                   'item_name', ii.item_name,\n                   'unit', ii.unit,\n                   'quantity', ii.quantity,\n                   'price', ii.price,\n                   'sku_code', ii.sku_code)\n                ORDER BY ii.line_no)\n          FROM docs.invoice_items ii\n         WHERE ii.invoice_id = i.id) AS items\n  FROM docs.invoices i\n WHERE i.exported_at IS NULL\n   AND EXISTS (SELECT 1 FROM docs.invoice_items ii\n                WHERE ii.invoice_id = i.id\n                  AND ii.link_processed = true)\n   AND NOT EXISTS (SELECT 1 FROM docs.invoice_items ii\n                    WHERE ii.invoice_id = i.id\n                      AND ii.link_processed IS NOT TRUE)\n ORDER BY i.id\n LIMIT 10;",
+        "options": {}
+      },
+      "id": "7a7c0007-0003-4000-8000-000000000003",
+      "name": "Get invoices to export",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2528,
+        544
+      ],
+      "executeOnce": true,
+      "credentials": {
+        "postgres": {
+          "id": "uSXpwajUhahtQd3N",
+          "name": "Postgres (invoices)"
+        }
+      },
+      "settings": {
+        "onError": "continueErrorOutput"
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// На каждую накладную — один транзакционный T-SQL батч (задача 004):\n// DELETE старой версии по file_name (каскад сносит позиции; устойчиво к\n// смене id при переобработке — решение владельца: delete+insert),\n// затем INSERT шапки и позиций. Идемпотентно: повтор того же батча\n// даёт тот же результат.\nconst q = v => v == null ? 'NULL' : \"N'\" + String(v).replace(/'/g, \"''\") + \"'\";\nconst num = v => (v == null || v === '' || isNaN(Number(v))) ? 'NULL' : String(Number(v));\nconst out = [];\nfor (const item of $input.all()) {\n  const inv = item.json;\n  const items = inv.items || [];\n  if (!items.length) continue;\n  const vals = items.map(ii =>\n    `(${ii.id}, ${inv.invoice_id}, ${ii.line_no}, ${q(ii.item_name)}, ${q(ii.unit)}, ${num(ii.quantity)}, ${num(ii.price)}, ${q(ii.sku_code)})`\n  ).join(',\\n');\n  const sql =\n`SET XACT_ABORT ON;\nBEGIN TRAN;\nDELETE FROM [exportImport].[dbo].[invoices] WHERE [file_name] = ${q(inv.file_name)};\nINSERT INTO [exportImport].[dbo].[invoices] (id, file_name)\nVALUES (${inv.invoice_id}, ${q(inv.file_name)});\nINSERT INTO [exportImport].[dbo].[invoice_items]\n  (id, invoice_id, line_no, item_name, unit, quantity, price, sku_code)\nVALUES\n${vals};\nCOMMIT;`;\n  out.push({ json: { invoice_id: inv.invoice_id, file_name: inv.file_name, items_count: items.length, sql } });\n}\nreturn out;"
+      },
+      "id": "7a7c0007-0004-4000-8000-000000000004",
+      "name": "Build T-SQL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2744,
+        544
+      ],
+      "settings": {
+        "onError": "continueErrorOutput"
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "={{ $json.sql }}",
+        "options": {}
+      },
+      "id": "7a7c0007-0005-4000-8000-000000000005",
+      "name": "Write to ERP",
+      "type": "n8n-nodes-base.microsoftSql",
+      "typeVersion": 1.2,
+      "position": [
+        2960,
+        544
+      ],
+      "credentials": {
+        "microsoftSql": {
+          "id": "__SET_IN_N8N__",
+          "name": "Microsoft SQL account"
+        }
+      },
+      "settings": {
+        "onError": "continueErrorOutput"
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Метка выгрузки — только после успешной записи в MS SQL\n-- (error-выход «Write to ERP» сюда не попадает: накладная уйдёт\n-- в повторный тик, delete+insert сделает повтор безопасным).\nUPDATE docs.invoices\n   SET exported_at = now()\n WHERE id = {{ $('Build T-SQL').item.json.invoice_id }};",
+        "options": {}
+      },
+      "id": "7a7c0007-0006-4000-8000-000000000006",
+      "name": "Mark exported",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        3184,
+        544
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "uSXpwajUhahtQd3N",
+          "name": "Postgres (invoices)"
+        }
+      },
+      "settings": {
+        "onError": "continueErrorOutput"
+      }
+    },
+    {
+      "parameters": {},
+      "id": "7a7c0007-0007-4000-8000-000000000007",
+      "name": "Error sink (see executions)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        2960,
+        784
+      ]
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Ensure ERP tables",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ensure ERP tables": {
+      "main": [
+        [
+          {
+            "node": "Get invoices to export",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error sink (see executions)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get invoices to export": {
+      "main": [
+        [
+          {
+            "node": "Build T-SQL",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error sink (see executions)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build T-SQL": {
+      "main": [
+        [
+          {
+            "node": "Write to ERP",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error sink (see executions)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write to ERP": {
+      "main": [
+        [
+          {
+            "node": "Mark exported",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Error sink (see executions)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark exported": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Error sink (see executions)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "tags": []
+}
